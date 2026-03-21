@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <string>
 #include <chrono>
 #include <cstdlib>
@@ -224,13 +225,54 @@ public:
             velocity_report.velocity.x = double(res["vx"]);
             velocity_report.velocity.y = double(res["vy"]);
             velocity_report.velocity.z = double(res["vz"]);
-            
-            for (size_t i = 0; i < 3; i++)
-            {
-                for (size_t j = 0; j < 3; j++)
-                {
-                    double val = double(res["covariance"][i][j]);
-                    velocity_report.velocity_covar[i*3 + j] = val;
+
+            // Firmware variants: covariance may be 3x3, flat length-9, a scalar, or missing.
+            // Indexing a number as [i][j] throws nlohmann::type_error.302 and kills the node.
+            const auto & cov_json = res["covariance"];
+            if (cov_json.is_array() && cov_json.size() == 3 && cov_json[0].is_array()) {
+                bool ok3x3 = true;
+                for (size_t i = 0; i < 3 && ok3x3; ++i) {
+                    if (!cov_json[i].is_array() || cov_json[i].size() < 3) {
+                        ok3x3 = false;
+                    }
+                }
+                if (ok3x3) {
+                    for (size_t i = 0; i < 3; ++i) {
+                        for (size_t j = 0; j < 3; ++j) {
+                            velocity_report.velocity_covar[i * 3 + j] = double(cov_json[i][j]);
+                        }
+                    }
+                } else {
+                    std::fill(
+                        std::begin(velocity_report.velocity_covar),
+                        std::end(velocity_report.velocity_covar), 0.0);
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: expected 3x3 array, got ragged array; using zeros");
+                }
+            } else if (cov_json.is_array() && cov_json.size() >= 9) {
+                for (size_t k = 0; k < 9; ++k) {
+                    velocity_report.velocity_covar[k] = double(cov_json[k]);
+                }
+            } else if (cov_json.is_number()) {
+                const double v = double(cov_json);
+                std::fill(
+                    std::begin(velocity_report.velocity_covar),
+                    std::end(velocity_report.velocity_covar), 0.0);
+                velocity_report.velocity_covar[0] = v;
+                velocity_report.velocity_covar[4] = v;
+                velocity_report.velocity_covar[8] = v;
+                RCLCPP_DEBUG_THROTTLE(
+                    get_logger(), *get_clock(), 10000,
+                    "DVL covariance: scalar treated as diagonal variances");
+            } else {
+                std::fill(
+                    std::begin(velocity_report.velocity_covar),
+                    std::end(velocity_report.velocity_covar), 0.0);
+                if (res.contains("covariance")) {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: unsupported JSON shape; using zeros");
                 }
             }
 
@@ -246,15 +288,20 @@ public:
             velocity_report.beam_ranges_valid = true;
             velocity_report.beam_velocities_valid = res["velocity_valid"];
 
-            // Beam specific data
-            for (size_t beam = 0; beam < 4; beam++)
-            {
-                velocity_report.num_good_beams += bool(res["transducers"][beam]["beam_valid"]);
-                velocity_report.range = res["transducers"][beam]["distance"];
-                //velocity_report.range_covar
-                velocity_report.beam_quality = res["transducers"][beam]["rssi"];
-                velocity_report.beam_velocity = res["transducers"][beam]["velocity"];
-                //velocity_report.beam_velocity_covar
+            velocity_report.num_good_beams = 0;
+            if (res["transducers"].is_array() && res["transducers"].size() >= 4) {
+                for (size_t beam = 0; beam < 4; beam++)
+                {
+                    const auto & td = res["transducers"][beam];
+                    velocity_report.num_good_beams += bool(td["beam_valid"]);
+                    velocity_report.range = td["distance"];
+                    velocity_report.beam_quality = td["rssi"];
+                    velocity_report.beam_velocity = td["velocity"];
+                }
+            } else {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 10000,
+                    "DVL velocity report: transducers missing or not a 4-element array");
             }
 
             velocity_pub->publish(velocity_report);
