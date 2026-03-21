@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <exception>
 #include <string>
 #include <chrono>
 #include <cstdlib>
@@ -38,6 +39,13 @@ public:
         this->declare_parameter<bool>("led_enabled", true);
         this->declare_parameter<int>("mountig_rotation_offset", 0);
         this->declare_parameter<std::string>("range_mode", "auto");
+        // Policy (Water Linked JSON): prefer nested 3×3 covariance; else flat-9; else nonnegative
+        // scalar diagonal; else diag(fom²) per protocol (fom = figure of merit, m/s); else defaults.
+        // See https://docs.waterlinked.com/dvl/dvl-protocol/
+        this->declare_parameter<double>("velocity_covariance_fallback_var_xy", 1.0);
+        this->declare_parameter<double>("velocity_covariance_fallback_var_z", 4.0);
+        // Dead-reckoning pose diagonal when std missing/unparsable (interpreted like driver: per-axis entry)
+        this->declare_parameter<double>("dead_reckoning_pose_covariance_fallback", 100.0);
 
         // Some information won't change, so we can fill it in here. 
         velocity_report.velocity_mode = marine_acoustic_msgs::msg::Dvl::DVL_MODE_BOTTOM;
@@ -92,6 +100,10 @@ public:
         std::string range_mode = this->get_parameter("range_mode").as_string();
         
         dvl.configure(speed_of_sound, false, led_enabled, mountig_rotation_offset, range_mode);
+
+        vel_cov_fb_xy_ = this->get_parameter("velocity_covariance_fallback_var_xy").as_double();
+        vel_cov_fb_z_ = this->get_parameter("velocity_covariance_fallback_var_z").as_double();
+        dr_pose_cov_fb_ = this->get_parameter("dead_reckoning_pose_covariance_fallback").as_double();
         
         // Set some values from parameters that won't change
         velocity_report.sound_speed = speed_of_sound;
@@ -227,54 +239,8 @@ public:
             velocity_report.velocity.z = double(res["vz"]);
 
             // Firmware variants: covariance may be 3x3, flat length-9, a scalar, or missing.
-            // Indexing a number as [i][j] throws nlohmann::type_error.302 and kills the node.
-            const auto & cov_json = res["covariance"];
-            if (cov_json.is_array() && cov_json.size() == 3 && cov_json[0].is_array()) {
-                bool ok3x3 = true;
-                for (size_t i = 0; i < 3 && ok3x3; ++i) {
-                    if (!cov_json[i].is_array() || cov_json[i].size() < 3) {
-                        ok3x3 = false;
-                    }
-                }
-                if (ok3x3) {
-                    for (size_t i = 0; i < 3; ++i) {
-                        for (size_t j = 0; j < 3; ++j) {
-                            velocity_report.velocity_covar[i * 3 + j] = double(cov_json[i][j]);
-                        }
-                    }
-                } else {
-                    std::fill(
-                        std::begin(velocity_report.velocity_covar),
-                        std::end(velocity_report.velocity_covar), 0.0);
-                    RCLCPP_WARN_THROTTLE(
-                        get_logger(), *get_clock(), 10000,
-                        "DVL covariance: expected 3x3 array, got ragged array; using zeros");
-                }
-            } else if (cov_json.is_array() && cov_json.size() >= 9) {
-                for (size_t k = 0; k < 9; ++k) {
-                    velocity_report.velocity_covar[k] = double(cov_json[k]);
-                }
-            } else if (cov_json.is_number()) {
-                const double v = double(cov_json);
-                std::fill(
-                    std::begin(velocity_report.velocity_covar),
-                    std::end(velocity_report.velocity_covar), 0.0);
-                velocity_report.velocity_covar[0] = v;
-                velocity_report.velocity_covar[4] = v;
-                velocity_report.velocity_covar[8] = v;
-                RCLCPP_DEBUG_THROTTLE(
-                    get_logger(), *get_clock(), 10000,
-                    "DVL covariance: scalar treated as diagonal variances");
-            } else {
-                std::fill(
-                    std::begin(velocity_report.velocity_covar),
-                    std::end(velocity_report.velocity_covar), 0.0);
-                if (res.contains("covariance")) {
-                    RCLCPP_WARN_THROTTLE(
-                        get_logger(), *get_clock(), 10000,
-                        "DVL covariance: unsupported JSON shape; using zeros");
-                }
-            }
+            // Indexing a number as [i][j] throws nlohmann::type_error and can kill the node.
+            fill_velocity_covariance_from_json(res);
 
             double current_altitude = double(res["altitude"]);
             if(current_altitude >= 0.0 && res["velocity_valid"])
@@ -336,10 +302,10 @@ public:
             dead_reckoning_report.pose.pose.position.y = double(res["y"]);
             dead_reckoning_report.pose.pose.position.z = double(res["z"]);
 
-            double std_dev = double(res["std"]);
-            dead_reckoning_report.pose.covariance[0] = std_dev;
-            dead_reckoning_report.pose.covariance[7] = std_dev;
-            dead_reckoning_report.pose.covariance[14] = std_dev;
+            const double dr_cov_diag = parse_dr_pose_covariance_diagonal(res);
+            dead_reckoning_report.pose.covariance[0] = dr_cov_diag;
+            dead_reckoning_report.pose.covariance[7] = dr_cov_diag;
+            dead_reckoning_report.pose.covariance[14] = dr_cov_diag;
 
             tf2::Quaternion quat;
             quat.setRPY(double(res["roll"]), double(res["pitch"]), double(res["yaw"]));
@@ -400,10 +366,170 @@ public:
 
 
 private:
+    /** Last resort: parameterized diagonal variances (m/s)². */
+    void apply_velocity_covariance_fallback(const char * reason)
+    {
+        std::fill(
+            std::begin(velocity_report.velocity_covar),
+            std::end(velocity_report.velocity_covar), 0.0);
+        velocity_report.velocity_covar[0] = vel_cov_fb_xy_;
+        velocity_report.velocity_covar[4] = vel_cov_fb_xy_;
+        velocity_report.velocity_covar[8] = vel_cov_fb_z_;
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 10000, "DVL velocity covariance default (%s): diag xy=%.4g z=%.4g",
+            reason, vel_cov_fb_xy_, vel_cov_fb_z_);
+    }
+
+    /** Protocol: FOM is max velocity uncertainty (m/s); use fom² as variance on each axis. */
+    bool try_velocity_covariance_from_fom(const DvlA50::Message& res)
+    {
+        if (!res.contains("fom") || res["fom"].is_null() || !res["fom"].is_number()) {
+            return false;
+        }
+        const double fom = res["fom"].get<double>();
+        if (!std::isfinite(fom) || fom < 0.0) {
+            return false;
+        }
+        const double v = fom * fom;
+        std::fill(
+            std::begin(velocity_report.velocity_covar),
+            std::end(velocity_report.velocity_covar), 0.0);
+        velocity_report.velocity_covar[0] = v;
+        velocity_report.velocity_covar[4] = v;
+        velocity_report.velocity_covar[8] = v;
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "DVL velocity covariance from fom² (fom=%.6g m/s)", fom);
+        return true;
+    }
+
+    /**
+     * Policy: 3×3 nested (primary) → flat 9 → nonnegative scalar diagonal → fom² → defaults.
+     * Never throws out of this function; throttled warnings on malformed input.
+     */
+    void fill_velocity_covariance_from_json(const DvlA50::Message& res)
+    {
+        std::fill(
+            std::begin(velocity_report.velocity_covar),
+            std::end(velocity_report.velocity_covar), 0.0);
+
+        try {
+            if (res.contains("covariance") && !res["covariance"].is_null()) {
+                const auto& cov_json = res["covariance"];
+
+                // 1) Primary: nested 3×3 (Water Linked json_v3.1 example format)
+                if (cov_json.is_array() && cov_json.size() == 3 && cov_json.at(0).is_array()) {
+                    bool ok3x3 = true;
+                    for (size_t i = 0; i < 3 && ok3x3; ++i) {
+                        if (!cov_json.at(i).is_array() || cov_json.at(i).size() < 3) {
+                            ok3x3 = false;
+                        }
+                    }
+                    if (ok3x3) {
+                        for (size_t i = 0; i < 3; ++i) {
+                            for (size_t j = 0; j < 3; ++j) {
+                                velocity_report.velocity_covar[i * 3 + j] =
+                                    cov_json.at(i).at(j).get<double>();
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // 2) Compatibility: flat length-9 row-major
+                if (cov_json.is_array() && cov_json.size() == 9) {
+                    for (size_t k = 0; k < 9; ++k) {
+                        velocity_report.velocity_covar[k] = cov_json.at(k).get<double>();
+                    }
+                    return;
+                }
+                if (cov_json.is_array() && cov_json.size() > 9) {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: flat array length %zu > 9, using first 9 entries",
+                        cov_json.size());
+                    for (size_t k = 0; k < 9; ++k) {
+                        velocity_report.velocity_covar[k] = cov_json.at(k).get<double>();
+                    }
+                    return;
+                }
+
+                // 3) Scalar nonnegative → diagonal (variances)
+                if (cov_json.is_number()) {
+                    const double v = cov_json.get<double>();
+                    if (std::isfinite(v) && v >= 0.0) {
+                        velocity_report.velocity_covar[0] = v;
+                        velocity_report.velocity_covar[4] = v;
+                        velocity_report.velocity_covar[8] = v;
+                        RCLCPP_DEBUG_THROTTLE(
+                            get_logger(), *get_clock(), 10000,
+                            "DVL covariance: nonnegative scalar diagonal variances");
+                        return;
+                    }
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: scalar invalid (negative or non-finite), trying fom / default");
+                }
+
+                if (cov_json.is_array()) {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: array shape not 3×3 or length 9, trying fom / default");
+                } else if (!cov_json.is_number()) {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 10000,
+                        "DVL covariance: unsupported JSON type, trying fom / default");
+                }
+            }
+
+            // 4) Fallback: fom² on diagonal (documented link between fom and covariance)
+            if (try_velocity_covariance_from_fom(res)) {
+                return;
+            }
+
+            // 5) Parameterized conservative default
+            apply_velocity_covariance_fallback(
+                res.contains("covariance") ? "no usable covariance" : "covariance missing");
+        } catch (const std::exception& e) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 10000,
+                "DVL covariance parse error: %s — trying fom / default", e.what());
+            std::fill(
+                std::begin(velocity_report.velocity_covar),
+                std::end(velocity_report.velocity_covar), 0.0);
+            if (try_velocity_covariance_from_fom(res)) {
+                return;
+            }
+            apply_velocity_covariance_fallback("exception after fom");
+        }
+    }
+
+    /** Same convention as original driver: value from JSON `std` on pose diagonal, or conservative fallback. */
+    double parse_dr_pose_covariance_diagonal(const DvlA50::Message& res)
+    {
+        if (!res.contains("std") || res["std"].is_null()) {
+            return dr_pose_cov_fb_;
+        }
+        try {
+            const auto& s = res["std"];
+            if (s.is_number()) {
+                return s.get<double>();
+            }
+            if (s.is_array() && !s.empty()) {
+                return s.at(0).get<double>();
+            }
+        } catch (const std::exception&) {
+        }
+        return dr_pose_cov_fb_;
+    }
+
     DvlA50 dvl;
 
     double rate;
     bool enable_on_activate;
+    double vel_cov_fb_xy_{1.0};
+    double vel_cov_fb_z_{4.0};
+    double dr_pose_cov_fb_{100.0};
 
     marine_acoustic_msgs::msg::Dvl velocity_report;
     geometry_msgs::msg::PoseWithCovarianceStamped dead_reckoning_report;
