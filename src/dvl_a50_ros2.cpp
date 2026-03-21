@@ -231,6 +231,8 @@ public:
         }
         else if(res.contains("altitude"))
         {
+            // Whole velocity-report path: any uncaught JSON/value error must not abort the node.
+            try {
             // Velocity report
             velocity_report.header.stamp = rclcpp::Time(uint64_t(res["time_of_validity"]) * 1000);
 
@@ -290,8 +292,13 @@ public:
                     odometry.twist.covariance[i*6 + j] = velocity_report.velocity_covar[i*3 + j];
                 }
             }
-            
+
             odometry_pub->publish(odometry);
+            } catch (const std::exception & e) {
+                RCLCPP_ERROR_THROTTLE(
+                    get_logger(), *get_clock(), 3000,
+                    "DVL velocity report dropped (JSON/field error): %s", e.what());
+            }
         }
         else if (res.contains("pitch"))
         {
