@@ -293,6 +293,9 @@ public:
                 for (size_t beam = 0; beam < 4; beam++)
                 {
                     const auto & td = res["transducers"][beam];
+                    if (!td.is_object()) {
+                        continue;
+                    }
                     velocity_report.num_good_beams += bool(td["beam_valid"]);
                     velocity_report.range = td["distance"];
                     velocity_report.beam_quality = td["rssi"];
