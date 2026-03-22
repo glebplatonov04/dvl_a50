@@ -23,6 +23,16 @@
 
 namespace {
 
+/** Serialise JSON for logging without throwing on invalid UTF-8 (strict dump() → type_error.316). */
+std::string json_dump_safe(const nlohmann::json & j)
+{
+    try {
+        return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    } catch (const std::exception & ex) {
+        return std::string("<json dump failed: ") + ex.what() + ">";
+    }
+}
+
 /** Safe numeric read for Water Linked JSON fields (avoids throws on bad types). */
 double wl_json_double(const nlohmann::json & j, double fallback = 0.0)
 {
@@ -224,6 +234,7 @@ public:
 
     void publish()
     {
+        try {
         DvlA50::Message res = dvl.receive();
 
         if (res.contains("response_to"))
@@ -234,11 +245,15 @@ public:
             // Always print the result
             if (res["success"])
             {
-                RCLCPP_INFO(get_logger(), "%s success: %s", trigger.c_str(), res["result"].dump().c_str());
+                RCLCPP_INFO(
+                    get_logger(), "%s success: %s", trigger.c_str(),
+                    json_dump_safe(res["result"]).c_str());
             }
             else
             {
-                RCLCPP_ERROR(get_logger(), "%s failed: %s", trigger.c_str(), res["error_message"].dump().c_str());
+                RCLCPP_ERROR(
+                    get_logger(), "%s failed: %s", trigger.c_str(),
+                    json_dump_safe(res["error_message"]).c_str());
             }
 
             // Check if we have a pending service call for this command and release it
@@ -344,7 +359,13 @@ public:
         }
         else
         {
-            RCLCPP_WARN(get_logger(), "Received unexpected DVL response: %s", res.dump().c_str());
+            RCLCPP_WARN(
+                get_logger(), "Received unexpected DVL response: %s", json_dump_safe(res).c_str());
+        }
+        } catch (const std::exception & e) {
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "DVL publish() exception (TCP/JSON): %s", e.what());
         }
     }
 
@@ -363,11 +384,11 @@ public:
         res->success = json_data["success"];
         if (res->success)
         {
-            res->message = json_data["result"];
+            res->message = json_dump_safe(json_data["result"]);
         }
         else
         {
-            res->message = json_data["error_message"];
+            res->message = json_dump_safe(json_data["error_message"]);
         }
     }
 
@@ -385,7 +406,7 @@ public:
 
         DvlA50::Message json_data = future.get();
         res->success = json_data["success"];
-        res->message = json_data["error_message"];
+        res->message = json_dump_safe(json_data["error_message"]);
     }
 
 
