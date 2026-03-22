@@ -58,6 +58,11 @@ public:
     DvlA50Node(std::string name)
     : rclcpp_lifecycle::LifecycleNode(name)
     {
+        // Separate groups so the wall timer (publish/receive) can run while a service waits on
+        // a TCP reply — required even with MultiThreadedExecutor (default = one mutual group).
+        cb_group_dvl_io_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        cb_group_services_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
         this->declare_parameter<std::string>("ip_address", "192.168.194.95");
         this->declare_parameter<std::string>("frame", "dvl_a50_link");
         this->declare_parameter<double>("rate", 30.0);
@@ -162,36 +167,49 @@ public:
         odometry_pub->on_activate();
         
         // Services
+        const auto srv_qos = rmw_qos_profile_services_default;
         enable_srv = this->create_service<std_srvs::srv::Trigger>(
-            "enable", 
-            bind(&DvlA50Node::srv_send_param<bool>, this, "acoustic_enabled", true, std::placeholders::_1, std::placeholders::_2));
+            "enable",
+            bind(&DvlA50Node::srv_send_param<bool>, this, "acoustic_enabled", true, std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         disable_srv = this->create_service<std_srvs::srv::Trigger>(
-            "disable", 
-            bind(&DvlA50Node::srv_send_param<bool>, this, "acoustic_enabled", false, std::placeholders::_1, std::placeholders::_2));
+            "disable",
+            bind(&DvlA50Node::srv_send_param<bool>, this, "acoustic_enabled", false, std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         get_config_srv = this->create_service<std_srvs::srv::Trigger>(
-            "get_config", 
-            bind(&DvlA50Node::srv_send_command, this, "get_config", std::placeholders::_1, std::placeholders::_2));
+            "get_config",
+            bind(&DvlA50Node::srv_send_command, this, "get_config", std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         calibrate_gyro_srv = this->create_service<std_srvs::srv::Trigger>(
-            "calibrate_gyro", 
-            bind(&DvlA50Node::srv_send_command, this, "calibrate_gyro", std::placeholders::_1, std::placeholders::_2));
+            "calibrate_gyro",
+            bind(&DvlA50Node::srv_send_command, this, "calibrate_gyro", std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         reset_dead_reckoning_srv = this->create_service<std_srvs::srv::Trigger>(
-            "reset_dead_reckoning", 
-            bind(&DvlA50Node::srv_send_command, this, "reset_dead_reckoning", std::placeholders::_1, std::placeholders::_2));
+            "reset_dead_reckoning",
+            bind(&DvlA50Node::srv_send_command, this, "reset_dead_reckoning", std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         trigger_ping_srv = this->create_service<std_srvs::srv::Trigger>(
-            "trigger_ping", 
-            bind(&DvlA50Node::srv_send_command, this, "trigger_ping", std::placeholders::_1, std::placeholders::_2));
+            "trigger_ping",
+            bind(&DvlA50Node::srv_send_command, this, "trigger_ping", std::placeholders::_1, std::placeholders::_2),
+            srv_qos,
+            cb_group_services_);
 
         // Start reading data
         RCLCPP_INFO(get_logger(), "Starting to receive reports at <= %f Hz", rate);
         timer = this->create_wall_timer(
-            std::chrono::duration<double>(1. / rate), 
-            std::bind(&DvlA50Node::publish, this)
-        );
+            std::chrono::duration<double>(1. / rate),
+            std::bind(&DvlA50Node::publish, this),
+            cb_group_dvl_io_);
 
         return CallbackReturn::SUCCESS;
     }
@@ -632,7 +650,10 @@ private:
     // Promises for in-flight service calls; completed from publish() when response_to matches.
     std::map<std::string, std::promise<DvlA50::Message>> pending_service_calls;
     std::mutex pending_service_calls_mutex_;
-    
+
+    rclcpp::CallbackGroup::SharedPtr cb_group_dvl_io_;
+    rclcpp::CallbackGroup::SharedPtr cb_group_services_;
+
     rclcpp::TimerBase::SharedPtr timer;
     rclcpp_lifecycle::LifecyclePublisher<marine_acoustic_msgs::msg::Dvl>::SharedPtr velocity_pub;
     rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr dead_reckoning_pub;
