@@ -113,7 +113,7 @@ public:
     {
         // Parameters
         std::string ip_address = this->get_parameter("ip_address").as_string();
-        std::string frame = this->get_parameter("frame").as_string();
+        frame_ = this->get_parameter("frame").as_string();
         rate = this->get_parameter("rate").as_double();
         RCLCPP_INFO(get_logger(), "Connecting to DVL A50 at %s", ip_address.c_str());
 
@@ -139,9 +139,15 @@ public:
         
         // Set some values from parameters that won't change
         velocity_report.sound_speed = speed_of_sound;
-        velocity_report.header.frame_id = frame;
-        dead_reckoning_report.header.frame_id = frame;
-        odometry.header.frame_id = frame;
+        velocity_report.header.frame_id = frame_;
+        dead_reckoning_report.header.frame_id = frame_;
+        odometry.header.frame_id = frame_;
+        // Twist from the DVL is in the sensor frame (same as static_tf child, e.g. dvl_a50_link).
+        odometry.child_frame_id = frame_;
+        RCLCPP_INFO(
+            get_logger(),
+            "DVL odometry header.frame_id and child_frame_id set to \"%s\"",
+            frame_.c_str());
         
         // Publishers
         velocity_pub = this->create_publisher<marine_acoustic_msgs::msg::Dvl>("dvl/velocity", 10);
@@ -347,12 +353,13 @@ public:
             // Could do this further up, but I prefer the clean separation over saving two tiny for loops.
             for (size_t i = 0; i < 3; i++)
             {
-                for (size_t j = 0; j < 3; j++)
-                {
-                    odometry.twist.covariance[i*6 + j] = velocity_report.velocity_covar[i*3 + j];
-                }
+            for (size_t j = 0; j < 3; j++)
+            {
+                odometry.twist.covariance[i*6 + j] = velocity_report.velocity_covar[i*3 + j];
             }
-            
+            }
+
+            stamp_odometry_frames_for_publish();
             odometry_pub->publish(odometry);
         }
         else if (res.contains("pitch"))
@@ -377,7 +384,8 @@ public:
 
             // Update the pose of the odometry
             odometry.header.stamp = dead_reckoning_report.header.stamp;
-            odometry.pose = dead_reckoning_report.pose;            
+            odometry.pose = dead_reckoning_report.pose;
+            stamp_odometry_frames_for_publish();
             odometry_pub->publish(odometry);
         }
         else
@@ -616,6 +624,13 @@ private:
         }
     }
 
+    /** Keep TF headers on every odometry publish (EKF / robot_localization expect child_frame_id). */
+    void stamp_odometry_frames_for_publish()
+    {
+        odometry.header.frame_id = frame_;
+        odometry.child_frame_id = frame_;
+    }
+
     /** Same convention as original driver: value from JSON `std` on pose diagonal, or conservative fallback. */
     double parse_dr_pose_covariance_diagonal(const DvlA50::Message& res)
     {
@@ -638,6 +653,7 @@ private:
     DvlA50 dvl;
 
     double rate;
+    std::string frame_;
     bool enable_on_activate;
     double vel_cov_fb_xy_{1.0};
     double vel_cov_fb_z_{4.0};

@@ -1,5 +1,7 @@
 #include "dvl_a50/dvl_a50.hpp"
 
+#include <cerrno>
+#include <cstring>
 
 using namespace dvl_a50;
 using nlohmann::json;
@@ -86,32 +88,46 @@ DvlA50::Message DvlA50::receive()
     // Single threaded access only
     std::lock_guard<std::mutex> lock(mtx);
 
-    char *tempBuffer = new char[1];
-    std::string str; 
-    
-    if(fault != 0)
-    {
+    if (fault != 0) {
         return {"fault", std::to_string(fault)};
     }
-    
-    while(tempBuffer[0] != '\n')
-    {
-        if(tcp_socket->Receive(tempBuffer) != 0)
-        {
-            str = str + tempBuffer[0];
+
+    // Read line-delimited JSON. Skip empty lines; handle recv errors (old code used an
+    // uninitialized byte and could spin forever if recv returned <= 0).
+    const int k_max_empty_lines = 256;
+    for (int line = 0; line < k_max_empty_lines; ++line) {
+        std::string str;
+        char ch = 0;
+        for (;;) {
+            const int n = tcp_socket->Receive(&ch);
+            if (n < 0) {
+                return {"error",
+                    std::string("TCP recv error while reading DVL line: ") + std::strerror(errno)};
+            }
+            if (n == 0) {
+                return {"error", "TCP connection closed while reading DVL line"};
+            }
+            if (ch == '\n') {
+                break;
+            }
+            str.push_back(ch);
+        }
+
+        while (!str.empty() && (str.back() == '\r' || str.back() == ' ' || str.back() == '\t')) {
+            str.pop_back();
+        }
+        if (str.empty()) {
+            continue;
+        }
+
+        try {
+            return json::parse(str);
+        } catch (std::exception & e) {
+            return {"error", std::string(e.what())};
         }
     }
 
-    delete tempBuffer;
-
-    try
-    {
-        return json::parse(str);
-    }
-    catch(std::exception& e)
-    {
-        return {"error", std::string(e.what())};
-    }
+    return {"error", "Too many consecutive empty lines from DVL"};
 }
 
 DvlA50::Message DvlA50::wait_for_response(std::function<bool(const Message&)> check, uint32_t timeout_ms)
