@@ -138,8 +138,13 @@ public:
     {
         LifecycleNode::on_activate(state);
 
+        // configure() and connect() intentionally left acoustic_enabled false until here.
         dvl.set_acoustic_enabled(enable_on_activate);
-        
+        RCLCPP_INFO(
+            get_logger(),
+            "Lifecycle activate: requested DVL acoustic_enabled=%s (ROS param enable_on_activate)",
+            enable_on_activate ? "true" : "false");
+
         velocity_pub->on_activate();
         dead_reckoning_pub->on_activate();
         odometry_pub->on_activate();
