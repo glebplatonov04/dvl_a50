@@ -24,6 +24,35 @@
 
 using namespace dvl_a50;
 
+namespace {
+
+bool wl_json_bool(const nlohmann::json & j, bool default_v = false)
+{
+    try {
+        if (j.is_boolean()) {
+            return j.get<bool>();
+        }
+        if (j.is_number()) {
+            return j.get<double>() != 0.0;
+        }
+    } catch (...) {
+    }
+    return default_v;
+}
+
+double wl_json_double(const nlohmann::json & j, double fallback = 0.0)
+{
+    try {
+        if (j.is_number()) {
+            return j.get<double>();
+        }
+    } catch (...) {
+    }
+    return fallback;
+}
+
+}  // namespace
+
 
 class DvlA50Node : public rclcpp_lifecycle::LifecycleNode
 {
@@ -231,43 +260,45 @@ public:
         }
         else if(res.contains("altitude"))
         {
-            // Whole velocity-report path: any uncaught JSON/value error must not abort the node.
+            // Entire branch: any remaining nlohmann misuse (e.g. transducers shape, ROS msg assign)
+            // must not abort the process.
             try {
             // Velocity report
-            velocity_report.header.stamp = rclcpp::Time(uint64_t(res["time_of_validity"]) * 1000);
+            const uint64_t tov = static_cast<uint64_t>(wl_json_double(res["time_of_validity"]));
+            velocity_report.header.stamp = rclcpp::Time(tov * 1000);
 
-            velocity_report.velocity.x = double(res["vx"]);
-            velocity_report.velocity.y = double(res["vy"]);
-            velocity_report.velocity.z = double(res["vz"]);
+            velocity_report.velocity.x = wl_json_double(res["vx"]);
+            velocity_report.velocity.y = wl_json_double(res["vy"]);
+            velocity_report.velocity.z = wl_json_double(res["vz"]);
 
-            // Firmware variants: covariance may be 3x3, flat length-9, a scalar, or missing.
-            // Indexing a number as [i][j] throws nlohmann::type_error and can kill the node.
             fill_velocity_covariance_from_json(res);
 
-            double current_altitude = double(res["altitude"]);
-            if(current_altitude >= 0.0 && res["velocity_valid"])
-            {
+            const double current_altitude = wl_json_double(res["altitude"]);
+            if (current_altitude >= 0.0 && wl_json_bool(res["velocity_valid"])) {
                 velocity_report.altitude = current_altitude;
             }
 
             velocity_report.course_gnd = std::atan2(velocity_report.velocity.y, velocity_report.velocity.x);
-            velocity_report.speed_gnd = std::sqrt(velocity_report.velocity.x * velocity_report.velocity.x + velocity_report.velocity.y * velocity_report.velocity.y);
+            velocity_report.speed_gnd = std::sqrt(
+                velocity_report.velocity.x * velocity_report.velocity.x +
+                velocity_report.velocity.y * velocity_report.velocity.y);
 
             velocity_report.beam_ranges_valid = true;
-            velocity_report.beam_velocities_valid = res["velocity_valid"];
+            velocity_report.beam_velocities_valid = wl_json_bool(res["velocity_valid"]);
 
             velocity_report.num_good_beams = 0;
-            if (res["transducers"].is_array() && res["transducers"].size() >= 4) {
-                for (size_t beam = 0; beam < 4; beam++)
-                {
-                    const auto & td = res["transducers"][beam];
+            if (res.contains("transducers") && res["transducers"].is_array() &&
+                res["transducers"].size() >= 4) {
+                const auto & transducers = res["transducers"];
+                for (size_t beam = 0; beam < 4; beam++) {
+                    const auto & td = transducers[beam];
                     if (!td.is_object()) {
                         continue;
                     }
-                    velocity_report.num_good_beams += bool(td["beam_valid"]);
-                    velocity_report.range = td["distance"];
-                    velocity_report.beam_quality = td["rssi"];
-                    velocity_report.beam_velocity = td["velocity"];
+                    velocity_report.num_good_beams += wl_json_bool(td["beam_valid"]);
+                    velocity_report.range = wl_json_double(td["distance"], velocity_report.range);
+                    velocity_report.beam_quality = wl_json_double(td["rssi"], velocity_report.beam_quality);
+                    velocity_report.beam_velocity = wl_json_double(td["velocity"], velocity_report.beam_velocity);
                 }
             } else {
                 RCLCPP_WARN_THROTTLE(
@@ -277,26 +308,22 @@ public:
 
             velocity_pub->publish(velocity_report);
 
-            // Update the twist of the odometry
             odometry.header.stamp = velocity_report.header.stamp;
             odometry.twist.twist.linear.x = velocity_report.velocity.x;
             odometry.twist.twist.linear.y = velocity_report.velocity.y;
             odometry.twist.twist.linear.z = velocity_report.velocity.z;
 
-            // Fill in the top left 3x3 of the 6x6 twist covariance matrix.
-            // Could do this further up, but I prefer the clean separation over saving two tiny for loops.
-            for (size_t i = 0; i < 3; i++)
-            {
-                for (size_t j = 0; j < 3; j++)
-                {
-                    odometry.twist.covariance[i*6 + j] = velocity_report.velocity_covar[i*3 + j];
+            for (size_t i = 0; i < 3; i++) {
+                for (size_t j = 0; j < 3; j++) {
+                    odometry.twist.covariance[i * 6 + j] =
+                        velocity_report.velocity_covar[i * 3 + j];
                 }
             }
 
             odometry_pub->publish(odometry);
             } catch (const std::exception & e) {
                 RCLCPP_ERROR_THROTTLE(
-                    get_logger(), *get_clock(), 3000,
+                    get_logger(), *get_clock(), 2000,
                     "DVL velocity report dropped (JSON/field error): %s", e.what());
             }
         }

@@ -1,5 +1,7 @@
 #include "dvl_a50/dvl_a50.hpp"
 
+#include <cctype>
+#include <string>
 
 using namespace dvl_a50;
 using nlohmann::json;
@@ -86,32 +88,43 @@ DvlA50::Message DvlA50::receive()
     // Single threaded access only
     std::lock_guard<std::mutex> lock(mtx);
 
-    char *tempBuffer = new char[1];
-    std::string str; 
-    
-    if(fault != 0)
-    {
+    if (fault != 0) {
         return {"fault", std::to_string(fault)};
     }
-    
-    while(tempBuffer[0] != '\n')
-    {
-        if(tcp_socket->Receive(tempBuffer) != 0)
-        {
-            str = str + tempBuffer[0];
+
+    char tempBuffer[1];
+    // DVL sometimes emits non-JSON lines (e.g. starting with '='); skip until a JSON object/array.
+    for (int line_attempt = 0; line_attempt < 64; ++line_attempt) {
+        std::string str;
+        tempBuffer[0] = '\0';
+        while (tempBuffer[0] != '\n') {
+            if (tcp_socket->Receive(tempBuffer) != 0) {
+                str += tempBuffer[0];
+            }
+        }
+        while (!str.empty() && (str.back() == '\r' || str.back() == '\n')) {
+            str.pop_back();
+        }
+        size_t i = 0;
+        while (i < str.size() &&
+               std::isspace(static_cast<unsigned char>(str[i]))) {
+            ++i;
+        }
+        if (i >= str.size()) {
+            continue;
+        }
+        const char c = str[i];
+        if (c != '{' && c != '[') {
+            continue;
+        }
+        try {
+            return json::parse(str.substr(i));
+        } catch (const std::exception & e) {
+            return {"error", std::string(e.what())};
         }
     }
 
-    delete tempBuffer;
-
-    try
-    {
-        return json::parse(str);
-    }
-    catch(std::exception& e)
-    {
-        return {"error", std::string(e.what())};
-    }
+    return {"error", "exceeded line read attempts without a JSON object/array line"};
 }
 
 DvlA50::Message DvlA50::wait_for_response(std::function<bool(const Message&)> check, uint32_t timeout_ms)
