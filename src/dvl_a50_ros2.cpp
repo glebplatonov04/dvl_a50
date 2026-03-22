@@ -7,8 +7,10 @@
 #include <cmath>
 #include <map>
 #include <future>
+#include <mutex>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/publisher.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <rclcpp_lifecycle/lifecycle_publisher.hpp>
@@ -257,11 +259,14 @@ public:
             }
 
             // Check if we have a pending service call for this command and release it
-            auto pending_it = pending_service_calls.find(trigger);
-            if (pending_it != pending_service_calls.end())
             {
-                pending_it->second.set_value(res);
-                pending_service_calls.erase(pending_it);
+                std::lock_guard<std::mutex> lock(pending_service_calls_mutex_);
+                auto pending_it = pending_service_calls.find(trigger);
+                if (pending_it != pending_service_calls.end())
+                {
+                    pending_it->second.set_value(res);
+                    pending_service_calls.erase(pending_it);
+                }
             }
         }
         else if(res.contains("altitude"))
@@ -370,6 +375,31 @@ public:
     }
 
 
+    static constexpr std::chrono::milliseconds k_service_reply_timeout{8000};
+
+    bool wait_for_service_reply(
+        const std::string & pending_key,
+        std::future<DvlA50::Message> & future,
+        DvlA50::Message & out,
+        std_srvs::srv::Trigger::Response::SharedPtr res)
+    {
+        if (future.wait_for(k_service_reply_timeout) != std::future_status::ready) {
+            {
+                std::lock_guard<std::mutex> lock(pending_service_calls_mutex_);
+                pending_service_calls.erase(pending_key);
+            }
+            res->success = false;
+            res->message =
+                "Timeout waiting for DVL TCP reply (no matching response_to within " +
+                std::to_string(k_service_reply_timeout.count()) + " ms). "
+                "Check link quality; garbage on the line prevents correlating commands.";
+            RCLCPP_ERROR(get_logger(), "%s", res->message.c_str());
+            return false;
+        }
+        out = future.get();
+        return true;
+    }
+
     void srv_send_command(
         std::string command,
         std_srvs::srv::Trigger::Request::SharedPtr req,
@@ -377,10 +407,16 @@ public:
     {
         std::promise<DvlA50::Message> promise;
         std::future<DvlA50::Message> future = promise.get_future();
-        pending_service_calls.insert(std::make_pair(command, std::move(promise)));
+        {
+            std::lock_guard<std::mutex> lock(pending_service_calls_mutex_);
+            pending_service_calls.insert(std::make_pair(command, std::move(promise)));
+        }
         dvl.send_command(command);
 
-        DvlA50::Message json_data = future.get();
+        DvlA50::Message json_data;
+        if (!wait_for_service_reply(command, future, json_data, res)) {
+            return;
+        }
         res->success = json_data["success"];
         if (res->success)
         {
@@ -401,12 +437,25 @@ public:
     {
         std::promise<DvlA50::Message> promise;
         std::future<DvlA50::Message> future = promise.get_future();
-        pending_service_calls.insert(std::make_pair("set_config", std::move(promise)));
+        {
+            std::lock_guard<std::mutex> lock(pending_service_calls_mutex_);
+            pending_service_calls.insert(std::make_pair("set_config", std::move(promise)));
+        }
         dvl.set(param, value);
 
-        DvlA50::Message json_data = future.get();
+        DvlA50::Message json_data;
+        if (!wait_for_service_reply("set_config", future, json_data, res)) {
+            return;
+        }
         res->success = json_data["success"];
-        res->message = json_dump_safe(json_data["error_message"]);
+        if (res->success)
+        {
+            res->message = json_dump_safe(json_data["result"]);
+        }
+        else
+        {
+            res->message = json_dump_safe(json_data["error_message"]);
+        }
     }
 
 
@@ -580,8 +629,9 @@ private:
     geometry_msgs::msg::PoseWithCovarianceStamped dead_reckoning_report;
     nav_msgs::msg::Odometry odometry;
 
-    // Promises of unfulfilled service calls; assumes that no service is called twice in parallel
+    // Promises for in-flight service calls; completed from publish() when response_to matches.
     std::map<std::string, std::promise<DvlA50::Message>> pending_service_calls;
+    std::mutex pending_service_calls_mutex_;
     
     rclcpp::TimerBase::SharedPtr timer;
     rclcpp_lifecycle::LifecyclePublisher<marine_acoustic_msgs::msg::Dvl>::SharedPtr velocity_pub;
@@ -605,7 +655,10 @@ int main(int argc, char * argv[])
     setvbuf(stdout, NULL, _IONBF, BUFSIZ);
 
     rclcpp::init(argc, argv);
-    rclcpp::executors::SingleThreadedExecutor exe;
+    // Services block on futures fulfilled by the timer-driven publish(); a single-threaded
+    // executor deadlocks (service callback holds the thread; publish never runs).
+    rclcpp::executors::MultiThreadedExecutor exe(
+        rclcpp::ExecutorOptions(), 4u);
     std::shared_ptr<DvlA50Node> node = std::make_shared<DvlA50Node>("dvl_a50");
     exe.add_node(node->get_node_base_interface());
     exe.spin();
