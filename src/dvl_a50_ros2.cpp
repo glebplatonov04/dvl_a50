@@ -78,8 +78,10 @@ public:
         this->declare_parameter<double>("velocity_covariance_fallback_var_z", 4.0);
         // Dead-reckoning pose diagonal when std missing/unparsable (interpreted like driver: per-axis entry)
         this->declare_parameter<double>("dead_reckoning_pose_covariance_fallback", 100.0);
-        // If false, do not publish dvl/dead_reckoning (fusion uses external IMU; topic optional for debug).
-        this->declare_parameter<bool>("publish_dead_reckoning_topic", true);
+        // If false, do not publish dvl/odometry when a dead-reckoning JSON arrives (stamp uses ts,
+        // often behind time_of_validity → negative consecutive Δt and redundant twist for the EKF).
+        // dvl/dead_reckoning is still published; only the second odometry publish is skipped.
+        this->declare_parameter<bool>("publish_odometry_on_dead_reckoning", true);
 
         // Some information won't change, so we can fill it in here. 
         velocity_report.velocity_mode = marine_acoustic_msgs::msg::Dvl::DVL_MODE_BOTTOM;
@@ -138,12 +140,12 @@ public:
         vel_cov_fb_xy_ = this->get_parameter("velocity_covariance_fallback_var_xy").as_double();
         vel_cov_fb_z_ = this->get_parameter("velocity_covariance_fallback_var_z").as_double();
         dr_pose_cov_fb_ = this->get_parameter("dead_reckoning_pose_covariance_fallback").as_double();
-        publish_dead_reckoning_topic_ =
-            this->get_parameter("publish_dead_reckoning_topic").as_bool();
+        publish_odometry_on_dead_reckoning_ =
+            this->get_parameter("publish_odometry_on_dead_reckoning").as_bool();
         RCLCPP_INFO(
             get_logger(),
-            "publish_dead_reckoning_topic=%s",
-            publish_dead_reckoning_topic_ ? "true" : "false");
+            "publish_odometry_on_dead_reckoning=%s",
+            publish_odometry_on_dead_reckoning_ ? "true" : "false");
 
         // Set some values from parameters that won't change
         velocity_report.sound_speed = speed_of_sound;
@@ -388,15 +390,19 @@ public:
             quat.setRPY(double(res["roll"]), double(res["pitch"]), double(res["yaw"]));
             dead_reckoning_report.pose.pose.orientation = tf2::toMsg(quat);
 
-            if (publish_dead_reckoning_topic_) {
-                dead_reckoning_pub->publish(dead_reckoning_report);
-            }
+            dead_reckoning_pub->publish(dead_reckoning_report);
 
-            // Update the pose of the odometry
-            odometry.header.stamp = dead_reckoning_report.header.stamp;
-            odometry.pose = dead_reckoning_report.pose;
-            stamp_odometry_frames_for_publish();
-            odometry_pub->publish(odometry);
+            if (publish_odometry_on_dead_reckoning_) {
+                odometry.header.stamp = dead_reckoning_report.header.stamp;
+                odometry.pose = dead_reckoning_report.pose;
+                stamp_odometry_frames_for_publish();
+                odometry_pub->publish(odometry);
+            } else {
+                // Keep pose in sync for the next velocity-cycle odometry publish (twist-only users
+                // still get an up-to-date pose field on dvl/odometry when stamp is time_of_validity).
+                odometry.pose = dead_reckoning_report.pose;
+                stamp_odometry_frames_for_publish();
+            }
         }
         else
         {
@@ -668,7 +674,7 @@ private:
     double vel_cov_fb_xy_{1.0};
     double vel_cov_fb_z_{4.0};
     double dr_pose_cov_fb_{100.0};
-    bool publish_dead_reckoning_topic_{true};
+    bool publish_odometry_on_dead_reckoning_{true};
 
     marine_acoustic_msgs::msg::Dvl velocity_report;
     geometry_msgs::msg::PoseWithCovarianceStamped dead_reckoning_report;

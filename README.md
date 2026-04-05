@@ -43,12 +43,12 @@ $ ros2 service call dvl_a50/enable
 Data from the DVL is published on the following topics:
 
 - `dvl/velocity`: _marine_acoustic_msgs/Dvl_
-- `dvl/dead_reckoning`: _geometry_msgs/PoseWithCovarianceStamped_ (optional; disable with parameter `publish_dead_reckoning_topic:=false` if unused)
+- `dvl/dead_reckoning`: _geometry_msgs/PoseWithCovarianceStamped_
 - `dvl/odometry`: _nav_msgs/Odometry_
 
 The velocity report also fills in the `beam_quality` array of the `Dvl` message using the Received Signal Strength Indicator (RSSI) reported for each beam. The values are in dBm and thus negative. Going counterclockwise from the cable, the transducers' indices are `1, 2, 3, 0`. See also the [official documentation](https://waterlinked.github.io/dvl/dvl-a50/).
 
-Since the DVL-A50 reports the velocity and dead reckoning at different frequencies, the odometry is published every time either of them is received, with only the `pose` or `twist` updated respectively.
+By default, odometry is published on both velocity and dead-reckoning reports (pose vs twist updates). Set `publish_odometry_on_dead_reckoning:=false` for a single `dvl/odometry` publish per velocity report while still publishing `dvl/dead_reckoning` (recommended for twist-only fusion / cleaner `header.stamp` on odometry).
 
 
 # Services
@@ -73,4 +73,4 @@ When using the default launch file, the configuration will be loaded from `confi
 - `led_enabled`: Whether the LED on the side of the DVL should be enabled. *boolean, default=true*.
 - `mounting_rotation_offset`: Clockwise rotation of the DVL in degrees relative to the vehicle frame. *int, default=0*.
 - `range_mode`: See [range mode configuration](https://waterlinked.github.io/dvl/dvl-protocol/#range-mode-configuration). *string, default=auto*.
-- `publish_dead_reckoning_topic`: Publish `dvl/dead_reckoning` when the device sends dead-reckoning JSON. *boolean, default=true*. Set *false* when navigation uses an external IMU and only DVL bottom velocity matters.
+- `publish_odometry_on_dead_reckoning`: Publish `dvl/odometry` when a dead-reckoning report arrives. *boolean, default=true*. Set *false* to emit odometry only on velocity reports (avoids mixed `ts` / `time_of_validity` stamps on the odometry topic).
