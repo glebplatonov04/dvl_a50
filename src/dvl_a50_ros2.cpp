@@ -78,6 +78,8 @@ public:
         this->declare_parameter<double>("velocity_covariance_fallback_var_z", 4.0);
         // Dead-reckoning pose diagonal when std missing/unparsable (interpreted like driver: per-axis entry)
         this->declare_parameter<double>("dead_reckoning_pose_covariance_fallback", 100.0);
+        // If false, do not publish dvl/dead_reckoning (fusion uses external IMU; topic optional for debug).
+        this->declare_parameter<bool>("publish_dead_reckoning_topic", true);
 
         // Some information won't change, so we can fill it in here. 
         velocity_report.velocity_mode = marine_acoustic_msgs::msg::Dvl::DVL_MODE_BOTTOM;
@@ -136,7 +138,13 @@ public:
         vel_cov_fb_xy_ = this->get_parameter("velocity_covariance_fallback_var_xy").as_double();
         vel_cov_fb_z_ = this->get_parameter("velocity_covariance_fallback_var_z").as_double();
         dr_pose_cov_fb_ = this->get_parameter("dead_reckoning_pose_covariance_fallback").as_double();
-        
+        publish_dead_reckoning_topic_ =
+            this->get_parameter("publish_dead_reckoning_topic").as_bool();
+        RCLCPP_INFO(
+            get_logger(),
+            "publish_dead_reckoning_topic=%s",
+            publish_dead_reckoning_topic_ ? "true" : "false");
+
         // Set some values from parameters that won't change
         velocity_report.sound_speed = speed_of_sound;
         velocity_report.header.frame_id = frame_;
@@ -380,7 +388,9 @@ public:
             quat.setRPY(double(res["roll"]), double(res["pitch"]), double(res["yaw"]));
             dead_reckoning_report.pose.pose.orientation = tf2::toMsg(quat);
 
-            dead_reckoning_pub->publish(dead_reckoning_report);
+            if (publish_dead_reckoning_topic_) {
+                dead_reckoning_pub->publish(dead_reckoning_report);
+            }
 
             // Update the pose of the odometry
             odometry.header.stamp = dead_reckoning_report.header.stamp;
@@ -658,6 +668,7 @@ private:
     double vel_cov_fb_xy_{1.0};
     double vel_cov_fb_z_{4.0};
     double dr_pose_cov_fb_{100.0};
+    bool publish_dead_reckoning_topic_{true};
 
     marine_acoustic_msgs::msg::Dvl velocity_report;
     geometry_msgs::msg::PoseWithCovarianceStamped dead_reckoning_report;
